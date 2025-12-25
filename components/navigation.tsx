@@ -3,6 +3,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { signOut, useSession } from 'next-auth/react';
 import { 
   LayoutDashboard, 
   Radio, 
@@ -42,6 +43,7 @@ const routes = [
 
 export function Navigation() {
   const pathname = usePathname();
+  const { data: session } = useSession();
 
   return (
     <nav className="border-b bg-card">
@@ -79,6 +81,22 @@ export function Navigation() {
               <div className="w-2 h-2 rounded-full bg-success animate-pulse-glow" />
               <span className="text-sm text-muted-foreground">Live</span>
             </div>
+
+            {session?.user ? (
+              <button
+                onClick={() => signOut({ callbackUrl: '/login' })}
+                className="text-sm px-3 py-1.5 rounded-md border hover:bg-accent transition-colors"
+              >
+                Sign out
+              </button>
+            ) : (
+              <Link
+                href="/login"
+                className="text-sm px-3 py-1.5 rounded-md border hover:bg-accent transition-colors"
+              >
+                Sign in
+              </Link>
+            )}
           </div>
         </div>
       </div>

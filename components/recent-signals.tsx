@@ -6,6 +6,25 @@ import { CheckCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export async function RecentSignals() {
+  const kvConfigured = Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+  if (!kvConfigured) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <span className="text-xl">📡</span>
+            Recent Signals
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-center text-muted-foreground py-8">
+            Connect Vercel KV to start receiving signals
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
+
   const signalIds = await kv.lrange('signals:list', 0, 4);
   const signals = await Promise.all(
     signalIds.map(async (id) => await kv.get(id as string))
