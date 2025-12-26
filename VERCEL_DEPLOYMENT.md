@@ -47,7 +47,7 @@ nextjs-trading/
 ├── tsconfig.json                 # TypeScript config
 ├── tailwind.config.ts            # Tailwind config
 ├── next.config.js                # Next.js config
-└── .env.local.example            # Env template
+└── env.local.example             # Env template
 ```
 
 ---
@@ -169,6 +169,12 @@ TRADIER_API_KEY=your_key_here
 TWELVE_DATA_API_KEY=your_key_here
 ALPACA_API_KEY=your_key_here
 ALPACA_SECRET_KEY=your_secret_here
+```
+
+### **Admin dashboard telemetry (KV-only):**
+```
+# Retain admin webhook/decision/order logs for N days (default: 30)
+ADMIN_KV_RETENTION_DAYS=30
 ```
 
 **After adding variables:**

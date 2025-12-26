@@ -40,7 +40,7 @@
 4.  tailwind.config.ts              - Tailwind CSS config
 5.  postcss.config.js               - PostCSS config
 6.  .gitignore                      - Git ignore rules
-7.  .env.local.example              - Environment template
+7.  env.local.example               - Environment template
 ```
 
 ### **Decision Engine (TypeScript):**
@@ -328,7 +328,7 @@ SAVINGS: $60-180/year! 💰
 ☐ Download all 23 files
 ☐ Organize in correct structure
 ☐ Install dependencies: npm install
-☐ Copy .env.local.example to .env.local
+☐ Copy env.local.example to .env.local
 ☐ Push to GitHub
 ☐ Import to Vercel
 ☐ Create Vercel KV database
@@ -380,7 +380,7 @@ nextjs-trading/
 ├── next.config.js             # Next.js
 ├── postcss.config.js          # PostCSS
 ├── .gitignore                 # Git
-├── .env.local.example         # Env template
+├── env.local.example          # Env template
 │
 ├── README.md                  # Documentation
 ├── QUICK_START.md             # Quick guide

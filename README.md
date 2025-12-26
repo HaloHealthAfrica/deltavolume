@@ -24,7 +24,7 @@ Modern, serverless trading system built with Next.js 14, TypeScript, and deploye
 npm install
 
 # Set up environment variables
-cp .env.local.example .env.local
+cp env.local.example .env.local
 # Edit .env.local with your values
 
 # Run development server
@@ -99,6 +99,10 @@ KV_URL=
 KV_REST_API_URL=
 KV_REST_API_TOKEN=
 KV_REST_API_READ_ONLY_TOKEN=
+
+# Admin dashboard telemetry (KV-only)
+# Retain admin webhook/decision/order logs for N days (default: 30)
+ADMIN_KV_RETENTION_DAYS=30
 ```
 
 ### Trading Strategies

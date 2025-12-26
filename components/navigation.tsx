@@ -9,7 +9,8 @@ import {
   Radio, 
   Briefcase, 
   TrendingUp, 
-  Settings 
+  Settings,
+  Shield
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -38,6 +39,11 @@ const routes = [
     label: 'Settings',
     icon: Settings,
     href: '/settings',
+  },
+  {
+    label: 'Admin',
+    icon: Shield,
+    href: '/admin',
   },
 ];
 
