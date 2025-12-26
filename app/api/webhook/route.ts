@@ -5,6 +5,16 @@ import { DecisionEngine, Strategy, type WebhookData } from '@/lib/decision-engin
 
 export const dynamic = 'force-dynamic';
 
+function webhookAuthed(request: Request): boolean {
+  const secret = process.env.WEBHOOK_SECRET;
+  if (!secret) return true; // auth disabled unless configured
+
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token');
+  const headerToken = request.headers.get('x-webhook-token');
+  return token === secret || headerToken === secret;
+}
+
 function parseCsv(value: string | undefined): string[] {
   if (!value) return [];
   return value
@@ -52,6 +62,7 @@ function buildEngine() {
 }
 
 export async function GET() {
+  // Health check should remain public even if webhook auth is enabled.
   const { config } = buildEngine();
   return NextResponse.json({
     status: 'healthy',
@@ -64,6 +75,10 @@ export async function GET() {
 
 export async function POST(request: Request) {
   try {
+    if (!webhookAuthed(request)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
     const data = (await request.json()) as WebhookData;
     const { engine, config } = buildEngine();
     const decision = engine.evaluate(data);
