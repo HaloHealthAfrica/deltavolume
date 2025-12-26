@@ -103,10 +103,42 @@ export async function POST(request: Request) {
       pattern: (result.signal.raw as any)?.strat?.patterns?.detected_name,
       decision: status,
       reason: result.validation.isValid ? result.decision.reasoning.join(' | ') : `Failed: ${result.validation.failedChecks.join(', ')}`,
+      // Back-compat: older UI expects shares; for options this is contracts.
       shares: result.decision.quantity,
+      quantity: result.decision.quantity,
       action: result.decision.action,
       instrumentType: result.decision.instrumentType,
       confidence: result.decision.confidence,
+      optionStructure: result.decision.optionStructure,
+      option: result.decision.optionContract
+        ? {
+            symbol: result.decision.optionContract.symbol,
+            underlying: result.decision.optionContract.underlying,
+            type: result.decision.optionContract.type,
+            expiration: result.decision.optionContract.expiration,
+            strike: result.decision.optionContract.strike,
+            bid: result.decision.optionContract.bid,
+            ask: result.decision.optionContract.ask,
+            last: result.decision.optionContract.last,
+            volume: result.decision.optionContract.volume,
+            openInterest: result.decision.optionContract.openInterest,
+            greeks: result.decision.optionContract.greeks,
+          }
+        : undefined,
+      spread: result.decision.optionSpread
+        ? {
+            structure: result.decision.optionSpread.structure,
+            expiration: result.decision.optionSpread.expiration,
+            width: result.decision.optionSpread.width,
+            estimatedDebit: result.decision.optionSpread.estimatedDebit,
+            estimatedCredit: result.decision.optionSpread.estimatedCredit,
+            estimatedMaxLoss: result.decision.optionSpread.estimatedMaxLoss,
+            estimatedMaxProfit: result.decision.optionSpread.estimatedMaxProfit,
+            longLeg: result.decision.optionSpread.longLeg,
+            shortLeg: result.decision.optionSpread.shortLeg,
+          }
+        : undefined,
+      legs: result.decision.optionLegs,
       // Full payloads for debugging/iteration:
       webhook: data,
       evaluated: result,

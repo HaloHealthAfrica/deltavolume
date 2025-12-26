@@ -2,6 +2,9 @@ import type {
   AlpacaMarketStatus,
   DVUFullSignalPayload,
   DVUEnrichment,
+  DVUOptionLeg,
+  DVUOptionSpread,
+  DVUOptionStructure,
   DVUTradeDecision,
   DVUValidationResult,
   DVUWebhookPayload,
@@ -30,6 +33,11 @@ function boolEnv(name: string, fallback: boolean) {
   const raw = (process.env[name] ?? '').trim().toLowerCase();
   if (!raw) return fallback;
   return raw === 'true' || raw === '1' || raw === 'yes';
+}
+
+function strEnv(name: string, fallback: string) {
+  const raw = (process.env[name] ?? '').trim();
+  return raw.length ? raw : fallback;
 }
 
 function isScannerPayload(payload: DVUWebhookPayload): payload is any {
@@ -333,6 +341,218 @@ function daysToExpiration(exp: string): number | undefined {
   return Math.floor(diff / 86400000);
 }
 
+function optionMid(opt: TradierOption): number | undefined {
+  const bid = Number(opt.bid);
+  const ask = Number(opt.ask);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid < 0 || ask <= 0) return undefined;
+  return (bid + ask) / 2;
+}
+
+function optionSpreadPct(opt: TradierOption): number | undefined {
+  const mid = optionMid(opt);
+  if (!mid || mid <= 0) return undefined;
+  return ((opt.ask - opt.bid) / mid) * 100;
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function parseOptionStructures(raw: string): DVUOptionStructure[] {
+  const v = (raw ?? '').trim().toLowerCase();
+  if (!v) return ['SINGLE'];
+  const parts = v.split(',').map((s) => s.trim()).filter(Boolean);
+  const out: DVUOptionStructure[] = [];
+  for (const p of parts) {
+    if (p === 'single') out.push('SINGLE');
+    else if (p === 'call_debit' || p === 'call_debit_spread') out.push('CALL_DEBIT_SPREAD');
+    else if (p === 'put_debit' || p === 'put_debit_spread') out.push('PUT_DEBIT_SPREAD');
+    else if (p === 'call_credit' || p === 'call_credit_spread') out.push('CALL_CREDIT_SPREAD');
+    else if (p === 'put_credit' || p === 'put_credit_spread') out.push('PUT_CREDIT_SPREAD');
+    else if (p === 'auto') out.push('AUTO' as any);
+  }
+  // Expand AUTO to a preference list (IV-sensitive in makeDecision).
+  if (out.includes('AUTO' as any)) {
+    return ['CALL_CREDIT_SPREAD', 'PUT_CREDIT_SPREAD', 'CALL_DEBIT_SPREAD', 'PUT_DEBIT_SPREAD', 'SINGLE'];
+  }
+  return out.length ? out : ['SINGLE'];
+}
+
+function buildLegFromOption(opt: TradierOption, side: DVUOptionLeg['side'], quantity: number): DVUOptionLeg {
+  return {
+    optionSymbol: opt.symbol,
+    side,
+    quantity,
+    expiration: opt.expiration,
+    strike: opt.strike,
+    optionType: opt.type,
+    greeks: opt.greeks,
+    bid: opt.bid,
+    ask: opt.ask,
+    last: opt.last,
+  };
+}
+
+function estMid(opt: TradierOption): number | undefined {
+  return optionMid(opt) ?? (Number.isFinite(opt.ask) && opt.ask > 0 ? opt.ask : undefined);
+}
+
+function findVerticalPartner(
+  options: TradierOption[],
+  base: TradierOption,
+  params: {
+    type: 'call' | 'put';
+    expiration: string;
+    direction: 'UP' | 'DOWN'; // strike direction for the partner leg
+    targetDeltaAbs: number;
+    minVol: number;
+    minOI: number;
+    maxSpreadPct: number;
+  }
+): TradierOption | null {
+  const exp = params.expiration;
+  const baseStrike = base.strike;
+  const candidates = options
+    .filter((o) => o.type === params.type && o.expiration === exp)
+    .filter((o) => (params.direction === 'UP' ? o.strike > baseStrike : o.strike < baseStrike))
+    .filter((o) => o.volume >= params.minVol && o.openInterest >= params.minOI)
+    .filter((o) => {
+      const sp = optionSpreadPct(o);
+      return !(typeof sp === 'number' && sp > params.maxSpreadPct);
+    })
+    .map((o) => {
+      const deltaAbs = o.greeks?.delta != null ? Math.abs(o.greeks.delta) : undefined;
+      const deltaDist = typeof deltaAbs === 'number' ? Math.abs(deltaAbs - params.targetDeltaAbs) : 999;
+      const strikeDist = Math.abs(o.strike - baseStrike);
+      return { o, score: deltaDist * 10 + strikeDist };
+    })
+    .sort((a, b) => a.score - b.score);
+  return candidates[0]?.o ?? null;
+}
+
+function buildVerticalSpread(
+  structure: Exclude<DVUOptionStructure, 'SINGLE'>,
+  base: TradierOption,
+  all: TradierOption[],
+  env: {
+    minVol: number;
+    minOI: number;
+    maxSpreadPct: number;
+    debitLongDeltaAbs: number;
+    debitShortDeltaAbs: number;
+    creditShortDeltaAbs: number;
+    creditLongDeltaAbs: number;
+  }
+): DVUOptionSpread | null {
+  const exp = base.expiration;
+  const isCall = structure === 'CALL_DEBIT_SPREAD' || structure === 'CALL_CREDIT_SPREAD';
+  const type: 'call' | 'put' = isCall ? 'call' : 'put';
+
+  // Debit: buy nearer, sell further OTM (call UP, put DOWN)
+  // Credit: sell nearer, buy further OTM (call UP, put DOWN)
+  const strikeDir: 'UP' | 'DOWN' = isCall ? 'UP' : 'DOWN';
+
+  if (structure === 'CALL_DEBIT_SPREAD' || structure === 'PUT_DEBIT_SPREAD') {
+    // base = long leg
+    const short = findVerticalPartner(all, base, {
+      type,
+      expiration: exp,
+      direction: strikeDir,
+      targetDeltaAbs: env.debitShortDeltaAbs,
+      minVol: env.minVol,
+      minOI: env.minOI,
+      maxSpreadPct: env.maxSpreadPct,
+    });
+    if (!short) return null;
+    const width = Math.abs(short.strike - base.strike);
+    const longMid = estMid(base);
+    const shortMid = estMid(short);
+    const debit = typeof longMid === 'number' && typeof shortMid === 'number' ? Math.max(0, longMid - shortMid) : undefined;
+    const maxLoss = typeof debit === 'number' ? debit * 100 : undefined;
+    const maxProfit = typeof debit === 'number' ? (width - debit) * 100 : undefined;
+    return {
+      structure,
+      expiration: exp,
+      width,
+      estimatedDebit: debit,
+      estimatedMaxLoss: maxLoss,
+      estimatedMaxProfit: typeof maxProfit === 'number' && Number.isFinite(maxProfit) ? maxProfit : undefined,
+      longLeg: buildLegFromOption(base, 'buy_to_open', 1),
+      shortLeg: buildLegFromOption(short, 'sell_to_open', 1),
+    };
+  }
+
+  // Credit: base = short leg
+  const long = findVerticalPartner(all, base, {
+    type,
+    expiration: exp,
+    direction: strikeDir,
+    targetDeltaAbs: env.creditLongDeltaAbs,
+    minVol: env.minVol,
+    minOI: env.minOI,
+    maxSpreadPct: env.maxSpreadPct,
+  });
+  if (!long) return null;
+  const width = Math.abs(base.strike - long.strike);
+  const shortMid = estMid(base);
+  const longMid = estMid(long);
+  const credit = typeof shortMid === 'number' && typeof longMid === 'number' ? Math.max(0, shortMid - longMid) : undefined;
+  const maxLoss = typeof credit === 'number' ? (width - credit) * 100 : undefined;
+  const maxProfit = typeof credit === 'number' ? credit * 100 : undefined;
+  return {
+    structure,
+    expiration: exp,
+    width,
+    estimatedCredit: credit,
+    estimatedMaxLoss: typeof maxLoss === 'number' && Number.isFinite(maxLoss) ? maxLoss : undefined,
+    estimatedMaxProfit: maxProfit,
+    longLeg: buildLegFromOption(long, 'buy_to_open', 1),
+    shortLeg: buildLegFromOption(base, 'sell_to_open', 1),
+  };
+}
+
+function baseOptionForStructure(
+  structure: Exclude<DVUOptionStructure, 'SINGLE'>,
+  all: TradierOption[],
+  fallback: TradierOption,
+  env: {
+    minVol: number;
+    minOI: number;
+    maxSpreadPct: number;
+    debitLongDeltaAbs: number;
+    creditShortDeltaAbs: number;
+  }
+): TradierOption {
+  // Choose a sane "base" option for the structure so we can construct spreads
+  // even when the signal direction doesn't match the option type.
+  const exp = fallback.expiration;
+  const wantsCall = structure === 'CALL_DEBIT_SPREAD' || structure === 'CALL_CREDIT_SPREAD';
+  const type: 'call' | 'put' = wantsCall ? 'call' : 'put';
+  const isDebit = structure === 'CALL_DEBIT_SPREAD' || structure === 'PUT_DEBIT_SPREAD';
+  const targetDelta = isDebit ? env.debitLongDeltaAbs : env.creditShortDeltaAbs;
+
+  const pool = all
+    .filter((o) => o.type === type && o.expiration === exp)
+    .filter((o) => o.volume >= env.minVol && o.openInterest >= env.minOI)
+    .filter((o) => {
+      const sp = optionSpreadPct(o);
+      return !(typeof sp === 'number' && sp > env.maxSpreadPct);
+    });
+  if (!pool.length) return fallback;
+
+  const best = pool
+    .map((o) => {
+      const d = o.greeks?.delta != null ? Math.abs(o.greeks.delta) : undefined;
+      const dd = typeof d === 'number' ? Math.abs(d - targetDelta) : 999;
+      // Prefer closer strikes as tie-breaker
+      const strikeDist = Math.abs(o.strike - fallback.strike);
+      return { o, score: dd * 10 + strikeDist * 0.01 };
+    })
+    .sort((a, b) => a.score - b.score)[0]?.o;
+
+  return best ?? fallback;
+}
+
 export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnrichment): TradierOption | null {
   const signal = normalizeWebhookPayload(payload);
   const direction = signal.direction;
@@ -342,7 +562,30 @@ export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnri
     enrichment.indicators?.atr ?? full?.levels?.atr ?? full?.risk_management?.atr_value ?? 0;
   const options = enrichment.options ?? [];
 
-  const candidates = options.filter((o) => (direction === 'LONG' ? o.type === 'call' : o.type === 'put'));
+  const minDte = numEnv('OPTIONS_MIN_DTE', 7);
+  const maxDte = numEnv('OPTIONS_MAX_DTE', 45);
+  const minVol = numEnv('OPTIONS_MIN_VOLUME', 10);
+  const minOI = numEnv('OPTIONS_MIN_OPEN_INTEREST', 100);
+  const maxSpreadPct = numEnv('OPTIONS_MAX_SPREAD_PCT', 12);
+  const minDelta = numEnv('OPTIONS_DELTA_MIN', 0.30);
+  const maxDelta = numEnv('OPTIONS_DELTA_MAX', 0.65);
+  const maxIv = numEnv('OPTIONS_MAX_IV', 2.0);
+
+  const candidates = options
+    .filter((o) => (direction === 'LONG' ? o.type === 'call' : o.type === 'put'))
+    .filter((o) => {
+      const dte = daysToExpiration(o.expiration);
+      if (typeof dte === 'number' && (dte < minDte || dte > maxDte)) return false;
+      if (o.volume < minVol) return false;
+      if (o.openInterest < minOI) return false;
+      const sp = optionSpreadPct(o);
+      if (typeof sp === 'number' && sp > maxSpreadPct) return false;
+      const deltaAbs = o.greeks?.delta != null ? Math.abs(o.greeks.delta) : undefined;
+      if (typeof deltaAbs === 'number' && (deltaAbs < minDelta || deltaAbs > maxDelta)) return false;
+      const iv = o.greeks?.mid_iv ?? o.greeks?.iv;
+      if (typeof iv === 'number' && Number.isFinite(iv) && iv > maxIv) return false;
+      return true;
+    });
   if (!candidates.length) return null;
 
   const scored = candidates.map((opt) => {
@@ -359,10 +602,12 @@ export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnri
     if (opt.volume > 100) score += 2;
     if (opt.openInterest > 500) score += 2;
 
-    // spread
-    const spread = opt.ask > 0 ? (opt.ask - opt.bid) / opt.ask : 1;
-    if (spread < 0.05) score += 2;
-    else if (spread < 0.1) score += 1;
+    // spread (relative to mid)
+    const spreadPct = optionSpreadPct(opt);
+    if (typeof spreadPct === 'number') {
+      if (spreadPct < 5) score += 2;
+      else if (spreadPct < 10) score += 1;
+    }
 
     // greeks
     const delta = opt.greeks?.delta != null ? Math.abs(opt.greeks.delta) : undefined;
@@ -379,6 +624,13 @@ export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnri
       else if (dte >= 7 && dte <= 45) score += 1;
     }
 
+    // IV (slight preference for lower IV when buying premium)
+    const iv = opt.greeks?.mid_iv ?? opt.greeks?.iv;
+    if (typeof iv === 'number' && Number.isFinite(iv)) {
+      if (iv < 0.35) score += 1;
+      else if (iv > 0.9) score -= 1;
+    }
+
     return { opt, score };
   });
 
@@ -389,19 +641,52 @@ export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnri
 export function calculatePositionSize(
   signal: NormalizedSignal,
   payload: DVUWebhookPayload,
-  option: TradierOption | null,
+  optionOrSpread: { kind: 'SINGLE'; option: TradierOption } | { kind: 'SPREAD'; spread: DVUOptionSpread } | null,
   maxRiskPerTradeFallback: number,
   maxPositionSizeFallback: number,
   enrichment: DVUEnrichment
 ): number {
-  if (option) {
-    const premium = option.ask * 100;
-    if (!premium || premium <= 0) return 1;
+  if (optionOrSpread?.kind === 'SPREAD') {
+    const maxLoss = optionOrSpread.spread.estimatedMaxLoss;
+    if (typeof maxLoss !== 'number' || !Number.isFinite(maxLoss) || maxLoss <= 0) return 0;
     const buyingPower = enrichment.tradierBalances?.buyingPower;
     const maxRisk = maxRiskPerTradeFallback;
-    const contractsFromRisk = Math.floor(maxRisk / premium);
-    const contractsFromBP = typeof buyingPower === 'number' && buyingPower > 0 ? Math.floor(buyingPower / premium) : contractsFromRisk;
-    return Math.max(1, Math.min(contractsFromRisk, contractsFromBP, 10));
+    const fromRisk = Math.floor(maxRisk / maxLoss);
+    const fromBP = typeof buyingPower === 'number' && buyingPower > 0 ? Math.floor(buyingPower / maxLoss) : fromRisk;
+    const maxSpreads = numEnv('OPTIONS_MAX_SPREADS', 10);
+    return Math.max(0, Math.min(fromRisk, fromBP, maxSpreads));
+  }
+
+  if (optionOrSpread?.kind === 'SINGLE') {
+    const option = optionOrSpread.option;
+    const mid = optionMid(option);
+    const price = (mid ?? option.ask) * 100;
+    if (!price || price <= 0) return 0;
+
+    // Risk model: worst-case is the premium paid, but we estimate risk to the underlying stop
+    // using delta (and gamma if present) to avoid oversizing near-the-money.
+    const full = asFullPayload(payload);
+    const underlyingEntry =
+      enrichment.alpacaQuote?.last ?? enrichment.tradierQuote?.last ?? signal.entry ?? full?.price?.close ?? 0;
+    const underlyingStop = signal.stopLoss ?? full?.risk_management?.stop_loss;
+    const move = typeof underlyingStop === 'number' && underlyingEntry > 0 ? Math.abs(underlyingEntry - underlyingStop) : undefined;
+
+    const deltaAbs = option.greeks?.delta != null ? Math.abs(option.greeks.delta) : undefined;
+    const gamma = option.greeks?.gamma;
+    let estimatedLoss = price; // cap at premium
+    if (typeof move === 'number' && move > 0 && typeof deltaAbs === 'number') {
+      const deltaComponent = deltaAbs * 100 * move;
+      const gammaComponent = typeof gamma === 'number' && Number.isFinite(gamma) ? 0.5 * Math.abs(gamma) * 100 * (move ** 2) : 0;
+      estimatedLoss = Math.min(price, deltaComponent + gammaComponent);
+    }
+
+    const buyingPower = enrichment.tradierBalances?.buyingPower;
+    const maxRisk = maxRiskPerTradeFallback;
+
+    const contractsFromRisk = estimatedLoss > 0 ? Math.floor(maxRisk / estimatedLoss) : 0;
+    const contractsFromBP = typeof buyingPower === 'number' && buyingPower > 0 ? Math.floor(buyingPower / price) : contractsFromRisk;
+    const maxContracts = numEnv('OPTIONS_MAX_CONTRACTS', 10);
+    return Math.max(0, Math.min(contractsFromRisk, contractsFromBP, maxContracts));
   }
 
   const full = asFullPayload(payload);
@@ -489,12 +774,73 @@ export function makeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment
   const enrichedSignal: NormalizedSignal = { ...signal, ...riskPlan };
 
   const bestOption = selectBestOption(enrichedSignal.raw, enrichment);
-  const useOptions =
-    disposition === 'EXECUTE' &&
-    Boolean(bestOption) &&
-    Boolean(enrichedSignal.isLegendary || enrichedSignal.isMega) &&
-    typeof enrichment.derived?.ivRank === 'number' &&
-    enrichment.derived.ivRank < 50;
+  const instrumentPref = strEnv('TRADE_INSTRUMENT', 'options').toLowerCase(); // options|stock
+  const preferOptions = instrumentPref !== 'stock';
+  const useOptions = Boolean(bestOption) && preferOptions;
+
+  // Spread selection (verticals). This does NOT auto-execute yet, but the decision will include legs/spread metadata.
+  const structuresRaw = strEnv('OPTIONS_STRUCTURES', 'auto,single');
+  let structures = parseOptionStructures(structuresRaw);
+
+  // IV-sensitive ordering when AUTO is present (we expanded it, now we prune for direction)
+  const ivRank = enrichment.derived?.ivRank;
+  if (typeof ivRank === 'number') {
+    // If IV is high, prefer credit spreads first; if low, prefer debit spreads first.
+    if (ivRank >= 60) {
+      structures = ['CALL_CREDIT_SPREAD', 'PUT_CREDIT_SPREAD', 'CALL_DEBIT_SPREAD', 'PUT_DEBIT_SPREAD', 'SINGLE'];
+    } else if (ivRank <= 40) {
+      structures = ['CALL_DEBIT_SPREAD', 'PUT_DEBIT_SPREAD', 'CALL_CREDIT_SPREAD', 'PUT_CREDIT_SPREAD', 'SINGLE'];
+    }
+  }
+
+  const spreadMinVol = numEnv('SPREAD_MIN_VOLUME', numEnv('OPTIONS_MIN_VOLUME', 10));
+  const spreadMinOI = numEnv('SPREAD_MIN_OPEN_INTEREST', numEnv('OPTIONS_MIN_OPEN_INTEREST', 100));
+  const spreadMaxPct = numEnv('SPREAD_MAX_SPREAD_PCT', numEnv('OPTIONS_MAX_SPREAD_PCT', 12));
+
+  const debitLongDelta = clamp(numEnv('SPREAD_DEBIT_LONG_DELTA', 0.55), 0.05, 0.95);
+  const debitShortDelta = clamp(numEnv('SPREAD_DEBIT_SHORT_DELTA', 0.25), 0.05, 0.95);
+  const creditShortDelta = clamp(numEnv('SPREAD_CREDIT_SHORT_DELTA', 0.30), 0.05, 0.95);
+  const creditLongDelta = clamp(numEnv('SPREAD_CREDIT_LONG_DELTA', 0.15), 0.05, 0.95);
+
+  let selectedStructure: DVUOptionStructure | undefined = undefined;
+  let optionSpread: DVUOptionSpread | null = null;
+  let optionAnchor: TradierOption | null = null;
+
+  if (useOptions && bestOption && enrichment.options?.length) {
+    for (const s of structures) {
+      if (s === 'SINGLE') {
+        selectedStructure = 'SINGLE';
+        optionAnchor = bestOption;
+        break;
+      }
+
+      const base = baseOptionForStructure(s as any, enrichment.options, bestOption, {
+        minVol: spreadMinVol,
+        minOI: spreadMinOI,
+        maxSpreadPct: spreadMaxPct,
+        debitLongDeltaAbs: debitLongDelta,
+        creditShortDeltaAbs: creditShortDelta,
+      });
+
+      const spread = buildVerticalSpread(s as any, base, enrichment.options, {
+        minVol: spreadMinVol,
+        minOI: spreadMinOI,
+        maxSpreadPct: spreadMaxPct,
+        debitLongDeltaAbs: debitLongDelta,
+        debitShortDeltaAbs: debitShortDelta,
+        creditShortDeltaAbs: creditShortDelta,
+        creditLongDeltaAbs: creditLongDelta,
+      });
+      if (spread) {
+        optionSpread = spread;
+        selectedStructure = s;
+        optionAnchor = base;
+        break;
+      }
+    }
+    if (!selectedStructure) selectedStructure = 'SINGLE';
+    if (!optionAnchor) optionAnchor = bestOption;
+  }
 
   const instrumentType: DVUTradeDecision['instrumentType'] = useOptions
     ? direction === 'LONG'
@@ -512,13 +858,19 @@ export function makeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment
       : calculatePositionSize(
           enrichedSignal,
           enrichedSignal.raw,
-          useOptions ? bestOption : null,
+          useOptions && optionSpread
+            ? { kind: 'SPREAD', spread: optionSpread }
+            : useOptions && bestOption
+              ? { kind: 'SINGLE', option: bestOption }
+              : null,
           riskBudget,
           maxPositionSizeFallback,
           enrichment
         );
 
   const entryPrice =
+    (useOptions && optionSpread?.estimatedDebit != null ? optionSpread.estimatedDebit : undefined) ??
+    (useOptions && optionSpread?.estimatedCredit != null ? optionSpread.estimatedCredit : undefined) ??
     (useOptions && bestOption?.ask && bestOption.ask > 0 ? bestOption.ask : undefined) ??
     enrichment.alpacaQuote?.last ??
     enrichment.tradierQuote?.last ??
@@ -536,12 +888,52 @@ export function makeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment
   if (full?.strat?.patterns?.detected_name) reasoning.push(`Pattern: ${full.strat.patterns.detected_name}`);
   if (full?.ict?.amd_phase) reasoning.push(`AMD: ${full.ict.amd_phase}`);
   if (signal.source === 'scanner') reasoning.push('Risk plan: derived from ATR (scanner)');
+  if (useOptions && optionAnchor) {
+    const dte = daysToExpiration(optionAnchor.expiration);
+    reasoning.push(
+      `Option: ${optionAnchor.type.toUpperCase()} ${optionAnchor.expiration} ${optionAnchor.strike} (DTE ${typeof dte === 'number' ? dte : '—'})`
+    );
+    if (optionAnchor.greeks?.delta != null) reasoning.push(`Δ ${optionAnchor.greeks.delta.toFixed(3)}`);
+    if (optionAnchor.greeks?.gamma != null) reasoning.push(`Γ ${optionAnchor.greeks.gamma.toFixed(4)}`);
+    if (optionAnchor.greeks?.theta != null) reasoning.push(`Θ ${optionAnchor.greeks.theta.toFixed(4)}`);
+    if (optionAnchor.greeks?.mid_iv != null || optionAnchor.greeks?.iv != null) {
+      const iv = optionAnchor.greeks.mid_iv ?? optionAnchor.greeks.iv!;
+      reasoning.push(`IV ${iv.toFixed(3)}`);
+    }
+    const sp = optionSpreadPct(optionAnchor);
+    if (typeof sp === 'number') reasoning.push(`Opt spread ${sp.toFixed(2)}%`);
+  }
+  if (useOptions && optionSpread) {
+    reasoning.push(`Structure: ${optionSpread.structure}`);
+    if (typeof optionSpread.estimatedDebit === 'number') reasoning.push(`Est debit: ${optionSpread.estimatedDebit.toFixed(2)}`);
+    if (typeof optionSpread.estimatedCredit === 'number') reasoning.push(`Est credit: ${optionSpread.estimatedCredit.toFixed(2)}`);
+    if (typeof optionSpread.estimatedMaxLoss === 'number') reasoning.push(`Est max loss: $${optionSpread.estimatedMaxLoss.toFixed(0)}`);
+    if (typeof optionSpread.estimatedMaxProfit === 'number') reasoning.push(`Est max profit: $${optionSpread.estimatedMaxProfit.toFixed(0)}`);
+  }
+
+  // If we can’t size at least 1 contract/share, don’t allow EXECUTE.
+  const finalDisposition: DVUTradeDecision['disposition'] =
+    disposition === 'EXECUTE' && quantity <= 0 ? 'PAPER' : disposition;
+  if (finalDisposition !== disposition && disposition === 'EXECUTE') {
+    reasoning.push('Auto-exec blocked: insufficient size for 1 contract within risk/buying power');
+  }
+
+  const optionLegs: DVUOptionLeg[] | undefined =
+    useOptions && optionSpread
+      ? [
+          { ...optionSpread.longLeg, quantity },
+          { ...optionSpread.shortLeg, quantity },
+        ]
+      : useOptions && optionAnchor
+        ? [buildLegFromOption(optionAnchor, 'buy_to_open', quantity)]
+        : undefined;
 
   return {
-    disposition,
+    disposition: finalDisposition,
     action,
     instrumentType,
-    symbol: useOptions ? bestOption!.symbol : enrichedSignal.ticker,
+    optionStructure: useOptions ? (selectedStructure ?? 'SINGLE') : undefined,
+    symbol: useOptions ? (optionSpread ? optionAnchor?.underlying ?? enrichedSignal.ticker : optionAnchor!.symbol) : enrichedSignal.ticker,
     quantity,
     entryPrice,
     stopLoss: enrichedSignal.stopLoss ?? 0,
@@ -549,13 +941,19 @@ export function makeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment
     target2: enrichedSignal.target2 ?? 0,
     confidence,
     reasoning,
-    optionContract: useOptions ? bestOption ?? undefined : undefined,
+    optionContract: useOptions ? optionAnchor ?? undefined : undefined,
+    optionSpread: useOptions ? optionSpread ?? undefined : undefined,
+    optionLegs,
   };
 }
 
 export async function executeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment, decision: DVUTradeDecision) {
   if (decision.disposition !== 'EXECUTE') return { executed: false, reason: 'Not in EXECUTE disposition' };
   if (!(decision.action === 'BUY' || decision.action === 'SELL')) return { executed: false, reason: 'No trade action' };
+  if (!Number.isFinite(decision.quantity) || decision.quantity <= 0) return { executed: false, reason: 'Quantity <= 0' };
+  if (decision.optionLegs && decision.optionLegs.length > 1) {
+    return { executed: false, reason: 'Multi-leg option spreads are not auto-executed yet (decision contains legs for future support)' };
+  }
 
   const enableAuto = boolEnv('ENABLE_AUTO_TRADING', false);
   if (!enableAuto) return { executed: false, reason: 'ENABLE_AUTO_TRADING disabled' };

@@ -86,9 +86,13 @@ export default async function SignalsPage() {
                   </div>
                   <div className="text-right shrink-0">
                     <div className="text-sm text-muted-foreground">{formatTimeAgo(s.timestamp)}</div>
-                    {typeof s.shares === 'number' && s.shares > 0 && (
-                      <div className="text-sm font-medium">{s.shares} qty</div>
-                    )}
+                    {(() => {
+                      const qty = Number(s.quantity ?? s.shares ?? 0);
+                      if (!Number.isFinite(qty) || qty <= 0) return null;
+                      const inst = String(s.instrumentType ?? '');
+                      const isOpt = inst === 'CALL' || inst === 'PUT' || Boolean(s.option);
+                      return <div className="text-sm font-medium">{qty} {isOpt ? 'contract(s)' : 'shares'}</div>;
+                    })()}
                   </div>
                 </div>
               ))}

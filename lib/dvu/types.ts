@@ -186,6 +186,47 @@ export type TradierOption = {
   };
 };
 
+export type OptionGreeks = NonNullable<TradierOption['greeks']>;
+
+export type DVUOptionOrderSide =
+  | 'buy_to_open'
+  | 'sell_to_open'
+  | 'buy_to_close'
+  | 'sell_to_close';
+
+export type DVUOptionLeg = {
+  optionSymbol: string;
+  side: DVUOptionOrderSide;
+  quantity: number; // contracts
+  expiration?: string;
+  strike?: number;
+  optionType?: 'call' | 'put';
+  greeks?: TradierOption['greeks'];
+  bid?: number;
+  ask?: number;
+  last?: number;
+};
+
+export type DVUOptionStructure =
+  | 'SINGLE'
+  | 'CALL_DEBIT_SPREAD'
+  | 'PUT_DEBIT_SPREAD'
+  | 'CALL_CREDIT_SPREAD'
+  | 'PUT_CREDIT_SPREAD';
+
+export type DVUOptionSpread = {
+  structure: Exclude<DVUOptionStructure, 'SINGLE'>;
+  expiration: string;
+  width: number;
+  // Best-effort pricing derived from chain quotes
+  estimatedDebit?: number; // per spread, in option price units (not *100)
+  estimatedCredit?: number; // per spread, in option price units (not *100)
+  estimatedMaxLoss?: number; // dollars per spread (already *100)
+  estimatedMaxProfit?: number; // dollars per spread (already *100)
+  longLeg: DVUOptionLeg;
+  shortLeg: DVUOptionLeg;
+};
+
 export type TwelveDataIndicators = {
   rsi?: number;
   atr?: number;
@@ -242,6 +283,7 @@ export type DVUTradeDecision = {
   // Action is the trade side if we were to trade.
   action: 'BUY' | 'SELL' | 'HOLD';
   instrumentType: 'STOCK' | 'CALL' | 'PUT';
+  optionStructure?: DVUOptionStructure;
   symbol: string;
   quantity: number;
   entryPrice: number;
@@ -251,6 +293,8 @@ export type DVUTradeDecision = {
   confidence: number;
   reasoning: string[];
   optionContract?: TradierOption;
+  optionSpread?: DVUOptionSpread;
+  optionLegs?: DVUOptionLeg[];
 };
 
 export type DVUValidationResult = {

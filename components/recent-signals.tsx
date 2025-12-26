@@ -96,6 +96,19 @@ export async function RecentSignals() {
                       {signal.pattern} • {signal.quality}⭐ •{' '}
                       ${signal.entry?.toFixed(2)}
                     </p>
+                    {signal.option?.expiration && signal.option?.strike != null && signal.option?.type && (
+                      <p className="text-xs text-muted-foreground">
+                        {String(signal.option.type).toUpperCase()} {signal.option.expiration} {signal.option.strike}
+                        {signal.option?.greeks?.delta != null ? ` • Δ ${Number(signal.option.greeks.delta).toFixed(2)}` : ''}
+                      </p>
+                    )}
+                    {signal.spread?.structure && signal.spread?.expiration && (
+                      <p className="text-xs text-muted-foreground">
+                        {String(signal.spread.structure).replaceAll('_', ' ')} • {signal.spread.expiration} • W {signal.spread.width}
+                        {signal.spread.estimatedCredit != null ? ` • Credit ${Number(signal.spread.estimatedCredit).toFixed(2)}` : ''}
+                        {signal.spread.estimatedDebit != null ? ` • Debit ${Number(signal.spread.estimatedDebit).toFixed(2)}` : ''}
+                      </p>
+                    )}
                     {signal.reason && (
                       <p
                         className={cn(
@@ -114,9 +127,17 @@ export async function RecentSignals() {
                   <p className="text-sm text-muted-foreground">
                     {formatTimeAgo(signal.timestamp)}
                   </p>
-                  {signal.shares > 0 && (
-                    <p className="text-sm font-medium">{signal.shares} shares</p>
-                  )}
+                  {(() => {
+                    const qty = Number(signal.quantity ?? signal.shares ?? 0);
+                    if (!Number.isFinite(qty) || qty <= 0) return null;
+                    const inst = String(signal.instrumentType ?? '');
+                    const isOpt = inst === 'CALL' || inst === 'PUT' || Boolean(signal.option);
+                    return (
+                      <p className="text-sm font-medium">
+                        {qty} {isOpt ? 'contract(s)' : 'shares'}
+                      </p>
+                    );
+                  })()}
                 </div>
               </div>
                 );
