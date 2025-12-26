@@ -1,6 +1,8 @@
 export type DVUDirection = 'LONG' | 'SHORT';
 
-export interface DVUWebhookPayload {
+// TradingView webhook formats supported by DVU.
+// Format 2: "DVU Full Signal" (comprehensive, single ticker)
+export interface DVUFullSignalPayload {
   signal: {
     type: string;
     direction: DVUDirection;
@@ -99,12 +101,67 @@ export interface DVUWebhookPayload {
   } & Record<string, boolean | number>;
 }
 
+// Format 1: "Scanner Signal" (lightweight, multiple tickers)
+export interface DVUScannerSignalPayload {
+  scanner: string;
+  signal: {
+    ticker: string;
+    direction: DVUDirection;
+    quality: 'LEGENDARY' | 'MEGA' | 'HIGH' | 'STANDARD' | string;
+    trigger_tf: string; // minutes as string e.g. "5"
+  };
+  strat?: {
+    tf1?: string;
+    tf2?: string;
+    tf3?: string;
+  };
+  conditions?: Record<string, boolean>;
+  timestamp: number; // ms epoch
+}
+
+export type DVUWebhookPayload = DVUFullSignalPayload | DVUScannerSignalPayload;
+
+export type NormalizedSignal = {
+  source: 'scanner' | 'full';
+  ticker: string;
+  direction: DVUDirection;
+  timestamp: number; // ms epoch
+  timeframeMinutes: number;
+  // Confluence is always normalized to a score + max.
+  confluenceScore: number;
+  maxConfluence: number;
+  // Signal strength flags/labels (best effort for scanner format).
+  qualityLabel?: string;
+  isLegendary?: boolean;
+  isMega?: boolean;
+  // Optional risk plan; if absent the engine may derive it from ATR.
+  entry?: number;
+  stopLoss?: number;
+  target1?: number;
+  target2?: number;
+  // Reference to original payload for debugging.
+  raw: DVUWebhookPayload;
+};
+
 export type TradierQuote = {
   symbol: string;
   last: number;
   bid: number;
   ask: number;
   volume?: number;
+};
+
+export type TradierPosition = {
+  symbol: string;
+  quantity: number;
+  costBasis?: number;
+};
+
+export type TradierBalances = {
+  accountNumber?: string;
+  equity?: number;
+  buyingPower?: number;
+  cash?: number;
 };
 
 export type TradierOption = {
@@ -147,28 +204,43 @@ export type AlpacaMarketStatus = {
   nextClose?: string;
 };
 
+export type AlpacaQuote = {
+  symbol: string;
+  last?: number;
+  bid?: number;
+  ask?: number;
+  dailyVolume?: number;
+};
+
 export type DVUEnrichment = {
   tradierQuote?: TradierQuote;
   options?: TradierOption[];
   indicators?: TwelveDataIndicators;
   marketStatus?: AlpacaMarketStatus;
+  alpacaQuote?: AlpacaQuote;
+  tradierBalances?: TradierBalances;
+  tradierPositions?: TradierPosition[];
   derived?: {
     spreadPct?: number;
     putCallRatio?: number;
-    ivRank?: number; // placeholder: needs history to compute properly
+    ivRank?: number; // estimated from chain (not true historical IV rank)
   };
 };
 
 export type DVUScores = {
   technicalScore: number; // 0-10
   optionsScore: number; // 0-10
-  originalScore: number; // 0-8
+  originalScore: number; // normalized confluence score
+  originalMax: number; // normalized confluence max
   finalScore: number; // 0-100
   confidence: number; // 0-100
 };
 
 export type DVUTradeDecision = {
-  action: 'BUY' | 'SELL' | 'HOLD' | 'SKIP';
+  // Disposition is the "what do we do" outcome (skip/paper/execute).
+  disposition: 'SKIP' | 'PAPER' | 'EXECUTE';
+  // Action is the trade side if we were to trade.
+  action: 'BUY' | 'SELL' | 'HOLD';
   instrumentType: 'STOCK' | 'CALL' | 'PUT';
   symbol: string;
   quantity: number;
@@ -186,5 +258,6 @@ export type DVUValidationResult = {
   checks: Record<string, boolean>;
   failedChecks: string[];
 };
+
 
 

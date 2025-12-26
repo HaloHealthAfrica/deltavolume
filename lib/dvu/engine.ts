@@ -1,15 +1,24 @@
 import type {
   AlpacaMarketStatus,
+  DVUFullSignalPayload,
   DVUEnrichment,
   DVUTradeDecision,
   DVUValidationResult,
   DVUWebhookPayload,
   DVUScores,
+  NormalizedSignal,
   TradierOption,
 } from '@/lib/dvu/types';
-import { fetchTradierOptions, fetchTradierQuote } from '@/lib/dvu/integrations/tradier';
+import {
+  fetchTradierBalances,
+  fetchTradierOptions,
+  fetchTradierPositions,
+  fetchTradierQuote,
+  placeTradierOptionBracketOrder,
+  placeTradierStockBracketOrder,
+} from '@/lib/dvu/integrations/tradier';
 import { fetchTwelveDataIndicators } from '@/lib/dvu/integrations/twelvedata';
-import { fetchAlpacaMarketStatus } from '@/lib/dvu/integrations/alpaca';
+import { fetchAlpacaMarketStatus, fetchAlpacaQuote } from '@/lib/dvu/integrations/alpaca';
 
 function numEnv(name: string, fallback: number) {
   const raw = process.env[name];
@@ -23,12 +32,124 @@ function boolEnv(name: string, fallback: boolean) {
   return raw === 'true' || raw === '1' || raw === 'yes';
 }
 
-export function validateSignal(payload: DVUWebhookPayload, minConfluenceScore: number): DVUValidationResult {
+function isScannerPayload(payload: DVUWebhookPayload): payload is any {
+  return Boolean((payload as any)?.scanner);
+}
+
+function asFullPayload(payload: DVUWebhookPayload): DVUFullSignalPayload | null {
+  if (isScannerPayload(payload)) return null;
+  const p = payload as any;
+  if (p?.signal && p?.market && p?.price) return payload as DVUFullSignalPayload;
+  return null;
+}
+
+export function normalizeWebhookPayload(payload: DVUWebhookPayload): NormalizedSignal {
+  if (isScannerPayload(payload)) {
+    const ticker = String((payload as any)?.signal?.ticker ?? '').trim().toUpperCase();
+    const direction = (payload as any)?.signal?.direction;
+    const timestamp = Number((payload as any)?.timestamp);
+    const timeframeMinutes = Number((payload as any)?.signal?.trigger_tf ?? 5);
+
+    const arrow = direction === 'SHORT' ? '↓' : '↑';
+    const tfStrings: string[] = [
+      (payload as any)?.strat?.tf1,
+      (payload as any)?.strat?.tf2,
+      (payload as any)?.strat?.tf3,
+    ].filter((s: any) => typeof s === 'string' && s.length > 0);
+
+    let confluenceScore = 0;
+    let maxConfluence = 3;
+    if (tfStrings.length) {
+      confluenceScore = tfStrings.filter((s) => s.includes(arrow)).length;
+      maxConfluence = tfStrings.length;
+    } else if ((payload as any)?.conditions && typeof (payload as any).conditions === 'object') {
+      const entries = Object.entries((payload as any).conditions as Record<string, boolean>);
+      confluenceScore = entries.filter(([_, v]) => Boolean(v)).length;
+      maxConfluence = Math.max(1, entries.length);
+      // Scanner thresholds are defined as 2/3; normalize down to 3 if it's larger.
+      if (maxConfluence > 3) {
+        const ratio = confluenceScore / maxConfluence;
+        maxConfluence = 3;
+        confluenceScore = Math.round(ratio * 3);
+      }
+    }
+
+    const qualityLabel = (payload as any)?.signal?.quality != null ? String((payload as any).signal.quality) : undefined;
+
+    return {
+      source: 'scanner',
+      ticker,
+      direction,
+      timestamp,
+      timeframeMinutes: Number.isFinite(timeframeMinutes) && timeframeMinutes > 0 ? timeframeMinutes : 5,
+      confluenceScore: Number.isFinite(confluenceScore as any) ? confluenceScore : 0,
+      maxConfluence: Number.isFinite(maxConfluence as any) ? maxConfluence : 3,
+      qualityLabel,
+      isLegendary: qualityLabel?.toUpperCase() === 'LEGENDARY',
+      isMega: qualityLabel?.toUpperCase() === 'MEGA',
+      raw: payload,
+    };
+  }
+
+  // Full DVU signal
+  const full = asFullPayload(payload);
+  if (!full) {
+    throw new Error('Unrecognized webhook payload shape');
+  }
+
+  return {
+    source: 'full',
+    ticker: String(full.market.ticker).trim().toUpperCase(),
+    direction: full.signal.direction,
+    timestamp: Number(full.market.timestamp),
+    timeframeMinutes: Number(full.market.timeframe_minutes),
+    confluenceScore: Number(full.signal.confluence_score ?? full.confluence?.total_score ?? 0),
+    maxConfluence: Number(full.signal.max_confluence ?? 10),
+    qualityLabel: full.signal.type,
+    isLegendary: Boolean(full.signal.is_legendary),
+    isMega: Boolean(full.signal.is_mega),
+    entry: full.price?.entry,
+    stopLoss: full.risk_management?.stop_loss,
+    target1: full.risk_management?.target_1,
+    target2: full.risk_management?.target_2,
+    raw: payload,
+  };
+}
+
+export function validateSignal(
+  signal: NormalizedSignal,
+  enrichment: DVUEnrichment,
+  context?: { dailyTradeCount?: number }
+): DVUValidationResult {
+  const now = Date.now();
+  const staleMs = numEnv('SIGNAL_MAX_AGE_MS', 2 * 60 * 1000);
+  const isStale = Number.isFinite(signal.timestamp as any) ? now - signal.timestamp > staleMs : true;
+
+  const minScanner = numEnv('MIN_CONFLUENCE_SCANNER', 2);
+  const minFull = numEnv('MIN_CONFLUENCE_FULL', 5);
+  const minConfluence = signal.source === 'scanner' ? minScanner : minFull;
+
+  const dailyLimit = numEnv('DAILY_TRADE_LIMIT', 10);
+  const dailyCount = context?.dailyTradeCount ?? 0;
+
+  const minBuyingPower = numEnv('MIN_BUYING_POWER', 1000);
+  const buyingPower = enrichment.tradierBalances?.buyingPower;
+
+  const tradierEnabled = Boolean(process.env.TRADIER_API_KEY && process.env.TRADIER_ACCOUNT_ID);
+  const alpacaEnabled = Boolean(process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY);
+
+  const hasPosition = tradierEnabled
+    ? Boolean(enrichment.tradierPositions?.some((p) => p.symbol?.toUpperCase() === signal.ticker.toUpperCase()))
+    : false;
+
   const checks = {
-    hasRequiredFields: Boolean(payload?.signal && payload?.market && payload?.price),
-    meetsMinConfluence: Number(payload?.confluence?.total_score ?? 0) >= minConfluenceScore,
-    isValidDirection: payload?.signal?.direction === 'LONG' || payload?.signal?.direction === 'SHORT',
-    hasRiskManagement: Boolean(payload?.risk_management?.stop_loss),
+    hasRequiredFields: Boolean(signal.ticker && (signal.direction === 'LONG' || signal.direction === 'SHORT')),
+    notStale: !isStale,
+    marketOpen: alpacaEnabled ? Boolean(enrichment.marketStatus?.isOpen) : true,
+    noExistingPosition: tradierEnabled ? !hasPosition : true,
+    meetsMinConfluence: Number(signal.confluenceScore ?? 0) >= minConfluence,
+    dailyTradeCountUnderLimit: dailyCount < dailyLimit,
+    buyingPowerEnough: tradierEnabled ? typeof buyingPower === 'number' && buyingPower >= minBuyingPower : true,
   };
 
   return {
@@ -57,38 +178,63 @@ function calcSpreadPct(quote: { bid: number; ask: number; last: number } | undef
 }
 
 export async function enrichSignal(payload: DVUWebhookPayload): Promise<DVUEnrichment> {
-  const ticker = payload.market.ticker;
-  const timeframe = payload.market.timeframe_minutes;
+  const signal = normalizeWebhookPayload(payload);
+  const ticker = signal.ticker;
+  const timeframe = signal.timeframeMinutes;
 
-  const tradierEnabled = Boolean(process.env.TRADIER_API_KEY);
+  const tradierEnabled = Boolean(process.env.TRADIER_API_KEY && process.env.TRADIER_ACCOUNT_ID);
   const twelveEnabled = Boolean(process.env.TWELVEDATA_API_KEY);
   const alpacaEnabled = Boolean(process.env.ALPACA_API_KEY && process.env.ALPACA_SECRET_KEY);
 
-  const [tradierQuote, options, indicators, marketStatus] = await Promise.all([
+  const [tradierQuote, options, indicators, marketStatus, alpacaQuote, tradierBalances, tradierPositions] = await Promise.all([
     tradierEnabled ? fetchTradierQuote(ticker).catch(() => undefined) : Promise.resolve(undefined),
     tradierEnabled ? fetchTradierOptions(ticker).catch(() => undefined) : Promise.resolve(undefined),
     twelveEnabled ? fetchTwelveDataIndicators(ticker, timeframe).catch(() => undefined) : Promise.resolve(undefined),
     alpacaEnabled ? fetchAlpacaMarketStatus().catch(() => undefined) : Promise.resolve<AlpacaMarketStatus | undefined>(undefined),
+    alpacaEnabled ? fetchAlpacaQuote(ticker).catch(() => undefined) : Promise.resolve(undefined),
+    tradierEnabled ? fetchTradierBalances().catch(() => undefined) : Promise.resolve(undefined),
+    tradierEnabled ? fetchTradierPositions().catch(() => undefined) : Promise.resolve(undefined),
   ]);
 
   const putCallRatio = calcPutCallRatio(options);
   const spreadPct = calcSpreadPct(tradierQuote);
 
-  // ivRank needs historical IV; placeholder until we track it in KV.
-  const ivRank = undefined;
+  const ivValues = (options ?? [])
+    .map((o) => o.greeks?.mid_iv ?? o.greeks?.iv)
+    .filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0);
+  const ivMin = ivValues.length ? Math.min(...ivValues) : undefined;
+  const ivMax = ivValues.length ? Math.max(...ivValues) : undefined;
+  const ivRank =
+    typeof ivMin === 'number' && typeof ivMax === 'number' && ivMax > ivMin
+      ? ((ivValues[Math.floor(ivValues.length / 2)] - ivMin) / (ivMax - ivMin)) * 100
+      : undefined;
 
   return {
     tradierQuote,
     options,
     indicators,
     marketStatus,
+    alpacaQuote,
+    tradierBalances,
+    tradierPositions,
     derived: { spreadPct, putCallRatio, ivRank },
   };
 }
 
-export function calculateTechnicalScore(payload: DVUWebhookPayload, enrichment: DVUEnrichment): number {
-  const direction = payload.signal.direction;
-  const price = payload.price.close;
+function currentPrice(signal: NormalizedSignal, enrichment: DVUEnrichment): number | undefined {
+  const full = asFullPayload(signal.raw);
+  return (
+    enrichment.alpacaQuote?.last ??
+    enrichment.tradierQuote?.last ??
+    signal.entry ??
+    full?.price?.close ??
+    undefined
+  );
+}
+
+export function calculateTechnicalScore(signal: NormalizedSignal, enrichment: DVUEnrichment): number {
+  const direction = signal.direction;
+  const price = currentPrice(signal, enrichment) ?? 0;
   const rsi = enrichment.indicators?.rsi;
   const adx = enrichment.indicators?.adx;
   const stochK = enrichment.indicators?.stochK;
@@ -135,8 +281,8 @@ export function calculateTechnicalScore(payload: DVUWebhookPayload, enrichment: 
   return Math.min(score, 10);
 }
 
-export function calculateOptionsScore(payload: DVUWebhookPayload, enrichment: DVUEnrichment): number {
-  const direction = payload.signal.direction;
+export function calculateOptionsScore(signal: NormalizedSignal, enrichment: DVUEnrichment): number {
+  const direction = signal.direction;
   const options = enrichment.options ?? [];
   const putCallRatio = enrichment.derived?.putCallRatio;
   const ivRank = enrichment.derived?.ivRank;
@@ -188,9 +334,12 @@ function daysToExpiration(exp: string): number | undefined {
 }
 
 export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnrichment): TradierOption | null {
-  const direction = payload.signal.direction;
-  const price = enrichment.tradierQuote?.last ?? payload.price.close;
-  const atr = payload.levels?.atr ?? payload.risk_management.atr_value ?? 0;
+  const signal = normalizeWebhookPayload(payload);
+  const direction = signal.direction;
+  const full = asFullPayload(payload);
+  const price = enrichment.tradierQuote?.last ?? enrichment.alpacaQuote?.last ?? full?.price?.close ?? signal.entry ?? 0;
+  const atr =
+    enrichment.indicators?.atr ?? full?.levels?.atr ?? full?.risk_management?.atr_value ?? 0;
   const options = enrichment.options ?? [];
 
   const candidates = options.filter((o) => (direction === 'LONG' ? o.type === 'call' : o.type === 'put'));
@@ -238,91 +387,220 @@ export function selectBestOption(payload: DVUWebhookPayload, enrichment: DVUEnri
 }
 
 export function calculatePositionSize(
+  signal: NormalizedSignal,
   payload: DVUWebhookPayload,
   option: TradierOption | null,
-  maxRiskPerTrade: number,
-  maxPositionSize: number
+  maxRiskPerTradeFallback: number,
+  maxPositionSizeFallback: number,
+  enrichment: DVUEnrichment
 ): number {
   if (option) {
     const premium = option.ask * 100;
     if (!premium || premium <= 0) return 1;
-    const contracts = Math.floor(maxRiskPerTrade / premium);
-    return Math.max(1, Math.min(contracts, 10));
+    const buyingPower = enrichment.tradierBalances?.buyingPower;
+    const maxRisk = maxRiskPerTradeFallback;
+    const contractsFromRisk = Math.floor(maxRisk / premium);
+    const contractsFromBP = typeof buyingPower === 'number' && buyingPower > 0 ? Math.floor(buyingPower / premium) : contractsFromRisk;
+    return Math.max(1, Math.min(contractsFromRisk, contractsFromBP, 10));
   }
 
-  const riskPerShare = payload.risk_management.risk_amount;
-  const sharesFromRisk = riskPerShare > 0 ? Math.floor(maxRiskPerTrade / riskPerShare) : 1;
-  const sharesFromSize = payload.price.close > 0 ? Math.floor(maxPositionSize / payload.price.close) : 1;
-  return Math.max(1, Math.min(sharesFromRisk, sharesFromSize));
+  const full = asFullPayload(payload);
+  const entry = currentPrice(signal, enrichment) ?? full?.price?.close ?? 0;
+  const stop = signal.stopLoss ?? full?.risk_management?.stop_loss;
+  const riskPerShare = typeof stop === 'number' && entry > 0 ? Math.abs(entry - stop) : undefined;
+
+  const maxRisk = maxRiskPerTradeFallback;
+  const maxPosSize = maxPositionSizeFallback;
+
+  const sharesFromRisk = typeof riskPerShare === 'number' && riskPerShare > 0 ? Math.floor(maxRisk / riskPerShare) : 1;
+  const sharesFromSize = entry > 0 ? Math.floor(maxPosSize / entry) : 1;
+  const buyingPower = enrichment.tradierBalances?.buyingPower;
+  const sharesFromBP = typeof buyingPower === 'number' && entry > 0 ? Math.floor(buyingPower / entry) : sharesFromRisk;
+
+  return Math.max(1, Math.min(sharesFromRisk, sharesFromSize, sharesFromBP));
 }
 
-export function calculateScores(payload: DVUWebhookPayload, enrichment: DVUEnrichment): DVUScores {
-  const originalScore = Number(payload.confluence?.total_score ?? 0);
-  const technicalScore = calculateTechnicalScore(payload, enrichment);
-  const optionsScore = calculateOptionsScore(payload, enrichment);
-  const finalScore = (originalScore / 8) * 50 + technicalScore * 3 + optionsScore * 2;
-  const confidence = Math.min(Math.max(finalScore, 0), 100);
-  return { technicalScore, optionsScore, originalScore, finalScore, confidence };
+export function calculateScores(signal: NormalizedSignal, enrichment: DVUEnrichment): DVUScores {
+  const originalScore = Number(signal.confluenceScore ?? 0);
+  const originalMax = Number(signal.maxConfluence ?? 10);
+  const technicalScore = calculateTechnicalScore(signal, enrichment);
+  const optionsScore = calculateOptionsScore(signal, enrichment);
+
+  const confluencePct = originalMax > 0 ? (originalScore / originalMax) * 100 : 0;
+  const technicalPct = (technicalScore / 10) * 100;
+  const optionsPct = (optionsScore / 10) * 100;
+
+  const confidence = Math.max(0, Math.min(confluencePct * 0.5 + technicalPct * 0.3 + optionsPct * 0.2, 100));
+  const finalScore = confidence;
+
+  return { technicalScore, optionsScore, originalScore, originalMax, finalScore, confidence };
 }
 
-export function makeDecision(payload: DVUWebhookPayload, enrichment: DVUEnrichment, scores: DVUScores): DVUTradeDecision {
-  const direction = payload.signal.direction;
+function deriveRiskPlan(signal: NormalizedSignal, enrichment: DVUEnrichment): Pick<NormalizedSignal, 'entry' | 'stopLoss' | 'target1' | 'target2'> {
+  const entry = signal.entry ?? currentPrice(signal, enrichment);
+  const atr = enrichment.indicators?.atr;
+  if (typeof entry !== 'number' || entry <= 0) return {};
+
+  // If already present (full payload), keep it.
+  if (typeof signal.stopLoss === 'number' && typeof signal.target1 === 'number' && typeof signal.target2 === 'number') {
+    return { entry, stopLoss: signal.stopLoss, target1: signal.target1, target2: signal.target2 };
+  }
+
+  const atrRef = typeof atr === 'number' && atr > 0 ? atr : entry * 0.01;
+  const stopMult = numEnv('SCANNER_ATR_STOP_MULT', 1.0);
+  const t1Mult = numEnv('SCANNER_ATR_T1_MULT', 1.5);
+  const t2Mult = numEnv('SCANNER_ATR_T2_MULT', 3.0);
+
+  if (signal.direction === 'LONG') {
+    return {
+      entry,
+      stopLoss: entry - atrRef * stopMult,
+      target1: entry + atrRef * t1Mult,
+      target2: entry + atrRef * t2Mult,
+    };
+  }
+  return {
+    entry,
+    stopLoss: entry + atrRef * stopMult,
+    target1: entry - atrRef * t1Mult,
+    target2: entry - atrRef * t2Mult,
+  };
+}
+
+function maxRiskPct(signal: NormalizedSignal): number {
+  if (signal.isLegendary) return 0.02;
+  if (signal.isMega) return 0.015;
+  const q = (signal.qualityLabel ?? '').toUpperCase();
+  if (q.includes('HIGH')) return 0.01;
+  return 0.005;
+}
+
+export function makeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment, scores: DVUScores): DVUTradeDecision {
+  const direction = signal.direction;
   const confidence = scores.confidence;
 
-  let action: DVUTradeDecision['action'] = 'HOLD';
-  if (confidence >= 70) action = direction === 'LONG' ? 'BUY' : 'SELL';
-  else if (confidence >= 50) action = direction === 'LONG' ? 'BUY' : 'SELL';
+  const disposition: DVUTradeDecision['disposition'] =
+    confidence < 50 ? 'SKIP' : confidence < 65 ? 'PAPER' : 'EXECUTE';
 
-  const bestOption = selectBestOption(payload, enrichment);
-  const instrumentType: DVUTradeDecision['instrumentType'] = bestOption
+  const action: DVUTradeDecision['action'] =
+    disposition === 'SKIP' ? 'HOLD' : direction === 'LONG' ? 'BUY' : 'SELL';
+
+  const riskPlan = deriveRiskPlan(signal, enrichment);
+  const enrichedSignal: NormalizedSignal = { ...signal, ...riskPlan };
+
+  const bestOption = selectBestOption(enrichedSignal.raw, enrichment);
+  const useOptions =
+    disposition === 'EXECUTE' &&
+    Boolean(bestOption) &&
+    Boolean(enrichedSignal.isLegendary || enrichedSignal.isMega) &&
+    typeof enrichment.derived?.ivRank === 'number' &&
+    enrichment.derived.ivRank < 50;
+
+  const instrumentType: DVUTradeDecision['instrumentType'] = useOptions
     ? direction === 'LONG'
       ? 'CALL'
       : 'PUT'
     : 'STOCK';
 
-  const maxRiskPerTrade = numEnv('MAX_RISK_PER_TRADE', 500);
-  const maxPositionSize = numEnv('MAX_POSITION_SIZE', 10000);
-  const quantity = calculatePositionSize(payload, bestOption, maxRiskPerTrade, maxPositionSize);
+  const equity = enrichment.tradierBalances?.equity;
+  const maxRiskPerTradeFallback = numEnv('MAX_RISK_PER_TRADE', 500);
+  const maxPositionSizeFallback = numEnv('MAX_POSITION_SIZE', 10000);
+  const riskBudget = typeof equity === 'number' && equity > 0 ? equity * maxRiskPct(enrichedSignal) : maxRiskPerTradeFallback;
+  const quantity =
+    disposition === 'SKIP'
+      ? 0
+      : calculatePositionSize(
+          enrichedSignal,
+          enrichedSignal.raw,
+          useOptions ? bestOption : null,
+          riskBudget,
+          maxPositionSizeFallback,
+          enrichment
+        );
 
   const entryPrice =
-    (bestOption?.ask && bestOption.ask > 0 ? bestOption.ask : undefined) ??
+    (useOptions && bestOption?.ask && bestOption.ask > 0 ? bestOption.ask : undefined) ??
+    enrichment.alpacaQuote?.last ??
     enrichment.tradierQuote?.last ??
-    payload.price.close;
+    enrichedSignal.entry ??
+    currentPrice(enrichedSignal, enrichment) ??
+    0;
 
   const reasoning: string[] = [];
-  reasoning.push(`Original confluence: ${scores.originalScore}/8`);
+  reasoning.push(`Confluence: ${scores.originalScore}/${scores.originalMax}`);
   reasoning.push(`Technical score: ${scores.technicalScore.toFixed(1)}/10`);
   reasoning.push(`Options score: ${scores.optionsScore.toFixed(1)}/10`);
+  reasoning.push(`Final confidence: ${confidence.toFixed(1)}%`);
   if (typeof enrichment.derived?.spreadPct === 'number') reasoning.push(`Spread: ${enrichment.derived.spreadPct.toFixed(2)}%`);
-  if (payload.strat?.patterns?.detected_name) reasoning.push(`Pattern: ${payload.strat.patterns.detected_name}`);
-  if (payload.ict?.amd_phase) reasoning.push(`AMD: ${payload.ict.amd_phase}`);
+  const full = asFullPayload(enrichedSignal.raw);
+  if (full?.strat?.patterns?.detected_name) reasoning.push(`Pattern: ${full.strat.patterns.detected_name}`);
+  if (full?.ict?.amd_phase) reasoning.push(`AMD: ${full.ict.amd_phase}`);
+  if (signal.source === 'scanner') reasoning.push('Risk plan: derived from ATR (scanner)');
 
   return {
+    disposition,
     action,
     instrumentType,
-    symbol: bestOption?.symbol || payload.market.ticker,
+    symbol: useOptions ? bestOption!.symbol : enrichedSignal.ticker,
     quantity,
     entryPrice,
-    stopLoss: payload.risk_management.stop_loss,
-    target1: payload.risk_management.target_1,
-    target2: payload.risk_management.target_2,
+    stopLoss: enrichedSignal.stopLoss ?? 0,
+    target1: enrichedSignal.target1 ?? 0,
+    target2: enrichedSignal.target2 ?? 0,
     confidence,
     reasoning,
-    optionContract: bestOption ?? undefined,
+    optionContract: useOptions ? bestOption ?? undefined : undefined,
   };
 }
 
-export async function processDVUWebhook(payload: DVUWebhookPayload) {
-  const minConfluence = numEnv('MIN_CONFLUENCE_SCORE', 5);
-  const validation = validateSignal(payload, minConfluence);
-  const enrichment = await enrichSignal(payload);
-  const scores = calculateScores(payload, enrichment);
-  const decision = makeDecision(payload, enrichment, scores);
+export async function executeDecision(signal: NormalizedSignal, enrichment: DVUEnrichment, decision: DVUTradeDecision) {
+  if (decision.disposition !== 'EXECUTE') return { executed: false, reason: 'Not in EXECUTE disposition' };
+  if (!(decision.action === 'BUY' || decision.action === 'SELL')) return { executed: false, reason: 'No trade action' };
 
   const enableAuto = boolEnv('ENABLE_AUTO_TRADING', false);
-  const shouldExecute = enableAuto && (decision.action === 'BUY' || decision.action === 'SELL');
+  if (!enableAuto) return { executed: false, reason: 'ENABLE_AUTO_TRADING disabled' };
 
-  return { validation, enrichment, scores, decision, shouldExecute };
+  const tradierEnabled = Boolean(process.env.TRADIER_API_KEY && process.env.TRADIER_ACCOUNT_ID);
+  if (!tradierEnabled) return { executed: false, reason: 'Tradier not configured (TRADIER_API_KEY/TRADIER_ACCOUNT_ID)' };
+
+  // Basic bracket orders (best-effort fields; Tradier may reject depending on account config).
+  if (decision.instrumentType === 'STOCK') {
+    const side = signal.direction === 'LONG' ? 'buy' : 'sell_short';
+    const res = await placeTradierStockBracketOrder({
+      symbol: signal.ticker,
+      side,
+      quantity: decision.quantity,
+      entryType: 'market',
+      stopLoss: decision.stopLoss,
+      takeProfit: decision.target1,
+    });
+    return { executed: true, order: res };
+  }
+
+  const opt = decision.optionContract;
+  if (!opt) return { executed: false, reason: 'No option contract selected' };
+  const res = await placeTradierOptionBracketOrder({
+    optionSymbol: opt.symbol,
+    quantity: decision.quantity,
+    entryType: 'market',
+    stopLoss: decision.stopLoss,
+    takeProfit: decision.target1,
+  });
+  return { executed: true, order: res };
 }
+
+export async function processDVUWebhook(payload: DVUWebhookPayload, context?: { dailyTradeCount?: number }) {
+  const signal = normalizeWebhookPayload(payload);
+  const enrichment = await enrichSignal(payload);
+  const scores = calculateScores(signal, enrichment);
+  const decision = makeDecision(signal, enrichment, scores);
+  const validation = validateSignal(signal, enrichment, context);
+
+  const shouldExecute = boolEnv('ENABLE_AUTO_TRADING', false) && decision.disposition === 'EXECUTE';
+  const execution = shouldExecute && validation.isValid ? await executeDecision(signal, enrichment, decision).catch((e) => ({ executed: false, error: e instanceof Error ? e.message : String(e) })) : undefined;
+
+  return { signal, validation, enrichment, scores, decision, shouldExecute, execution };
+}
+
 
 
