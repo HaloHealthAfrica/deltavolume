@@ -2,7 +2,7 @@
 import { kv } from '@vercel/kv';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { formatTimeAgo } from '@/lib/utils';
-import { CheckCircle, XCircle } from 'lucide-react';
+import { CheckCircle, MinusCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export async function RecentSignals() {
@@ -46,21 +46,33 @@ export async function RecentSignals() {
         ) : (
           <div className="space-y-4">
             {signals.map((signal: any, i) => (
+              (() => {
+                const decision = String(signal?.decision ?? '');
+                const isExecuted = decision === 'executed';
+                const isHold = decision === 'hold';
+                const borderClass = isExecuted
+                  ? 'border-success/20 bg-success/5'
+                  : isHold
+                    ? 'border-warning/20 bg-warning/5'
+                    : 'border-destructive/20 bg-destructive/5';
+
+                const Icon = isExecuted ? CheckCircle : isHold ? MinusCircle : XCircle;
+                const iconClass = isExecuted
+                  ? 'text-success'
+                  : isHold
+                    ? 'text-warning'
+                    : 'text-destructive';
+
+                return (
               <div
                 key={i}
                 className={cn(
                   'flex items-center justify-between p-4 rounded-lg border',
-                  signal.decision === 'executed'
-                    ? 'border-success/20 bg-success/5'
-                    : 'border-destructive/20 bg-destructive/5'
+                  borderClass
                 )}
               >
                 <div className="flex items-center gap-3">
-                  {signal.decision === 'executed' ? (
-                    <CheckCircle className="h-5 w-5 text-success" />
-                  ) : (
-                    <XCircle className="h-5 w-5 text-destructive" />
-                  )}
+                  <Icon className={cn('h-5 w-5', iconClass)} />
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="font-mono font-bold">
@@ -81,8 +93,13 @@ export async function RecentSignals() {
                       {signal.pattern} • {signal.quality}⭐ •{' '}
                       ${signal.entry?.toFixed(2)}
                     </p>
-                    {signal.decision === 'rejected' && (
-                      <p className="text-xs text-destructive mt-1">
+                    {signal.reason && (
+                      <p
+                        className={cn(
+                          'text-xs mt-1',
+                          decision === 'rejected' ? 'text-destructive' : 'text-muted-foreground'
+                        )}
+                      >
                         {signal.reason}
                       </p>
                     )}
@@ -97,6 +114,8 @@ export async function RecentSignals() {
                   )}
                 </div>
               </div>
+                );
+              })()
             ))}
           </div>
         )}

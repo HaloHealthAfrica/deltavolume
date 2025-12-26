@@ -67,6 +67,7 @@ export async function StatsCards() {
   // Fetch metrics from KV
   const totalSignals = await kv.get<number>('metrics:total_signals') || 0;
   const executed = await kv.get<number>('metrics:signals_executed') || 0;
+  const hold = await kv.get<number>('metrics:signals_hold') || 0;
   const rejected = await kv.get<number>('metrics:signals_rejected') || 0;
   
   // Get today's signals
@@ -84,12 +85,13 @@ export async function StatsCards() {
   );
   
   const todayExecuted = todaySignals.filter((s: any) => s.decision === 'executed').length;
+  const todayHold = todaySignals.filter((s: any) => s.decision === 'hold').length;
   
   const stats = [
     {
       title: "Today's Signals",
       value: todaySignals.length,
-      change: `${todayExecuted} executed`,
+      change: `${todayExecuted} executed • ${todayHold} hold`,
       icon: TrendingUp,
       color: 'text-success',
     },

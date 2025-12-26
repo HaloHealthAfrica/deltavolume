@@ -38,7 +38,11 @@ export async function POST(request: Request) {
     const data = (await request.json()) as DVUWebhookPayload;
     const result = await processDVUWebhook(data);
 
-    const status = result.validation.isValid ? 'processed' : 'rejected';
+    const status = !result.validation.isValid
+      ? 'rejected'
+      : result.decision.action === 'BUY' || result.decision.action === 'SELL'
+        ? 'executed'
+        : 'hold';
 
     // Still return a decision even if KV isn't configured (useful for local testing).
     if (!kvConfigured()) {
@@ -84,7 +88,13 @@ export async function POST(request: Request) {
       kv.lpush('signals:list', id),
       kv.ltrim('signals:list', 0, 999),
       kv.incr('metrics:total_signals'),
-      kv.incr(status === 'processed' ? 'metrics:signals_executed' : 'metrics:signals_rejected'),
+      kv.incr(
+        status === 'executed'
+          ? 'metrics:signals_executed'
+          : status === 'hold'
+            ? 'metrics:signals_hold'
+            : 'metrics:signals_rejected'
+      ),
     ]);
 
     return NextResponse.json({
