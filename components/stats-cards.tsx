@@ -85,13 +85,14 @@ export async function StatsCards() {
   );
   
   const todayExecuted = todaySignals.filter((s: any) => s.decision === 'executed').length;
+  const todayPaper = todaySignals.filter((s: any) => s.decision === 'paper' || s.decision === 'approved').length;
   const todayHold = todaySignals.filter((s: any) => s.decision === 'hold').length;
   
   const stats = [
     {
       title: "Today's Signals",
       value: todaySignals.length,
-      change: `${todayExecuted} executed • ${todayHold} hold`,
+      change: `${todayExecuted} executed • ${todayPaper} paper`,
       icon: TrendingUp,
       color: 'text-success',
     },

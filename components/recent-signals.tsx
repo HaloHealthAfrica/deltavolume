@@ -49,11 +49,14 @@ export async function RecentSignals() {
               (() => {
                 const decision = String(signal?.decision ?? '');
                 const isExecuted = decision === 'executed';
-                const isHold = decision === 'hold';
+                const isHold = decision === 'hold' || decision === 'paper' || decision === 'approved';
+                const isSkipped = decision === 'skipped';
                 const borderClass = isExecuted
                   ? 'border-success/20 bg-success/5'
                   : isHold
                     ? 'border-warning/20 bg-warning/5'
+                    : isSkipped
+                      ? 'border-muted bg-muted/30'
                     : 'border-destructive/20 bg-destructive/5';
 
                 const Icon = isExecuted ? CheckCircle : isHold ? MinusCircle : XCircle;
@@ -97,7 +100,9 @@ export async function RecentSignals() {
                       <p
                         className={cn(
                           'text-xs mt-1',
-                          decision === 'rejected' ? 'text-destructive' : 'text-muted-foreground'
+                          decision === 'rejected' || decision === 'execute_failed'
+                            ? 'text-destructive'
+                            : 'text-muted-foreground'
                         )}
                       >
                         {signal.reason}
