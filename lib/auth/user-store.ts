@@ -5,6 +5,7 @@ export type UserRecord = {
   id: string;
   email: string;
   passwordHash: string;
+  role?: 'admin' | 'user';
   createdAt: string;
 };
 
@@ -20,7 +21,11 @@ export async function getUserByEmail(email: string): Promise<UserRecord | null> 
   return user ?? null;
 }
 
-export async function createUser(email: string, password: string): Promise<UserRecord> {
+export async function createUser(
+  email: string,
+  password: string,
+  opts?: { role?: 'admin' | 'user' }
+): Promise<UserRecord> {
   const kvConfigured = Boolean(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
   if (!kvConfigured) {
     throw new Error('KV is not configured. Create/connect Vercel KV and set KV_* env vars.');
@@ -36,6 +41,7 @@ export async function createUser(email: string, password: string): Promise<UserR
     id: `user_${crypto.randomUUID()}`,
     email: email.toLowerCase(),
     passwordHash,
+    role: opts?.role ?? 'user',
     createdAt: new Date().toISOString(),
   };
 

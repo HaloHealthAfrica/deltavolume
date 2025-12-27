@@ -27,6 +27,7 @@ export const authOptions: NextAuthOptions = {
         return {
           id: user.id,
           email: user.email,
+          role: user.role ?? 'user',
         };
       },
     }),
@@ -34,12 +35,14 @@ export const authOptions: NextAuthOptions = {
   callbacks: {
     async jwt({ token, user }) {
       if (user?.id) token.sub = user.id;
+      if ((user as any)?.role) (token as any).role = (user as any).role;
       return token;
     },
     async session({ session, token }) {
       if (session.user) {
         // next-auth types don't include id by default; we attach it.
         (session.user as any).id = token.sub;
+        (session.user as any).role = (token as any).role ?? 'user';
       }
       return session;
     },

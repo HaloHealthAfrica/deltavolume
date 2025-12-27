@@ -14,8 +14,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 });
     }
 
-    const user = await createUser(email, password);
-    return NextResponse.json({ id: user.id, email: user.email }, { status: 201 });
+    const user = await createUser(email, password, { role: 'user' });
+    return NextResponse.json({ id: user.id, email: user.email, role: user.role ?? 'user' }, { status: 201 });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     const status = message === 'User already exists' ? 409 : 400;
